@@ -4,20 +4,83 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import logging
+import weakref
 
+import pyarrow as pa
 from pyarrow import flight
 
-from sqlalchemy_dremio.exceptions import Error, NotSupportedError
+from sqlalchemy_dremio.exceptions import (  # noqa: F401 - DB-API module globals
+    DatabaseError,
+    DataError,
+    Error,
+    IntegrityError,
+    InterfaceError,
+    InternalError,
+    NotSupportedError,
+    OperationalError,
+    ProgrammingError,
+    Warning,
+)
 from sqlalchemy_dremio.flight_middleware import CookieMiddlewareFactory
+from sqlalchemy_dremio.params import bind
 from sqlalchemy_dremio.query import execute
 
 logger = logging.getLogger(__name__)
 
+apilevel = '2.0'
+threadsafety = 1
 paramstyle = 'qmark'
 
 
-def connect(c):
-    return Connection(c)
+class DBAPITypeObject(object):
+    """PEP 249 type object comparing equal to the Dremio type names in description."""
+
+    def __init__(self, *values):
+        self.values = frozenset(values)
+
+    def __eq__(self, other):
+        return other in self.values
+
+    def __ne__(self, other):
+        return other not in self.values
+
+    def __hash__(self):
+        return hash(self.values)
+
+
+STRING = DBAPITypeObject('VARCHAR')
+BINARY = DBAPITypeObject('VARBINARY')
+NUMBER = DBAPITypeObject('TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'FLOAT', 'DOUBLE',
+                         'DECIMAL', 'BOOLEAN')
+DATETIME = DBAPITypeObject('DATE', 'TIME', 'TIMESTAMP')
+ROWID = DBAPITypeObject()
+
+
+def translate_error(exc):
+    """Map an Arrow/Flight exception to the matching DB-API exception class."""
+    if isinstance(exc, Error):
+        return exc
+    if isinstance(exc, (flight.FlightUnavailableError, flight.FlightTimedOutError,
+                        flight.FlightCancelledError, flight.FlightUnauthenticatedError)):
+        cls = OperationalError
+    elif isinstance(exc, flight.FlightUnauthorizedError):
+        cls = ProgrammingError
+    elif isinstance(exc, pa.ArrowNotImplementedError):
+        cls = NotSupportedError
+    elif isinstance(exc, (pa.ArrowInvalid, pa.ArrowKeyError, pa.ArrowIndexError,
+                          pa.ArrowTypeError)):
+        # Flight maps gRPC INVALID_ARGUMENT (parse errors, unknown objects,
+        # bad casts) to ArrowInvalid.
+        cls = ProgrammingError
+    else:
+        cls = DatabaseError
+    error = cls(str(exc))
+    error.__cause__ = exc
+    return error
+
+
+def connect(c=None, **properties):
+    return Connection(c, **properties)
 
 
 def check_closed(f):
@@ -25,7 +88,7 @@ def check_closed(f):
 
     def g(self, *args, **kwargs):
         if self.closed:
-            raise Error(
+            raise InterfaceError(
                 '{klass} already closed'.format(klass=self.__class__.__name__))
         return f(self, *args, **kwargs)
 
@@ -43,35 +106,44 @@ def check_result(f):
     return d
 
 
+def parse_connection_string(connection_string):
+    """Parse the legacy ``KEY=value;KEY=value`` form.
+
+    A value cannot contain ``;``; pass keyword properties to ``connect`` instead.
+    """
+    properties = {}
+    for kvpair in connection_string.split(";"):
+        if not kvpair:
+            continue
+        kv = kvpair.split("=", 1)
+        properties[kv[0]] = kv[1]
+    return properties
+
+
 class Connection(object):
 
-    def __init__(self, connection_string):
-
-        # Build a map from the connection string supplied using the SQLAlchemy URI
-        # and supplied properties. The format is generated from DremioDialect_flight.create_connect_args()
-        # and is a semi-colon delimited string of key=value pairs. Note that the value itself can
-        # contain equal signs.
-        properties = {}
-        splits = connection_string.split(";")
-
-        for kvpair in splits:
-            kv = kvpair.split("=",1)
-            properties[kv[0]] = kv[1]
+    def __init__(self, connection_string=None, **properties):
+        # Properties come from DremioDialect_flight.create_connect_args() as
+        # keyword arguments, so values such as passwords may contain any
+        # character. A legacy semicolon-delimited string is still accepted.
+        if connection_string:
+            properties = dict(parse_connection_string(connection_string), **properties)
 
         connection_args = {}
 
         # Connect to the server endpoint with an encrypted TLS connection by default.
         protocol = 'tls'
-        if 'UseEncryption' in properties and properties['UseEncryption'].lower() == 'false':
+        if 'UseEncryption' in properties and str(properties['UseEncryption']).lower() == 'false':
             protocol = 'tcp'
         else:
             # Specify the trusted certificates
             connection_args['disable_server_verification'] = False
             if 'TrustedCerts' in properties:
-                with open(properties['TrustedCerts'] , "rb") as root_certs:
+                with open(properties['TrustedCerts'], "rb") as root_certs:
                     connection_args["tls_root_certs"] = root_certs.read()
             # Or disable server verification entirely
-            elif 'DisableCertificateVerification' in properties and properties['DisableCertificateVerification'].lower() == 'true':
+            elif 'DisableCertificateVerification' in properties and \
+                    str(properties['DisableCertificateVerification']).lower() == 'true':
                 connection_args['disable_server_verification'] = True
 
         # Enabling cookie middleware for stateful connectivity.
@@ -79,14 +151,18 @@ class Connection(object):
 
         client = flight.FlightClient('grpc+{0}://{1}:{2}'.format(protocol, properties['HOST'], properties['PORT']),
             middleware=[client_cookie_middleware], **connection_args)
-        
+
         # Authenticate either using basic username/password or using the Token parameter.
         headers = []
-        if 'UID' in properties:
-            bearer_token = client.authenticate_basic_token(properties['UID'], properties['PWD'])
-            headers.append(bearer_token)
-        else:
-            headers.append((b'authorization', "Bearer {}".format(properties['Token']).encode('utf-8')))
+        try:
+            if 'UID' in properties:
+                bearer_token = client.authenticate_basic_token(properties['UID'], properties['PWD'])
+                headers.append(bearer_token)
+            else:
+                headers.append((b'authorization', "Bearer {}".format(properties['Token']).encode('utf-8')))
+        except Exception as exc:
+            _close_client(client)
+            raise translate_error(exc)
 
         # Propagate Dremio-specific headers.
         def add_header(properties, headers, header_name):
@@ -103,7 +179,7 @@ class Connection(object):
         self.options = flight.FlightCallOptions(headers=headers)
 
         self.closed = False
-        self.cursors = []
+        self.cursors = weakref.WeakSet()
 
     @check_closed
     def rollback(self):
@@ -111,13 +187,14 @@ class Connection(object):
 
     @check_closed
     def close(self):
-        """Close the connection now."""
+        """Close the connection now, releasing its Flight client."""
         self.closed = True
-        for cursor in self.cursors:
+        for cursor in list(self.cursors):
             try:
                 cursor.close()
             except Error:
                 pass  # already closed
+        _close_client(self.flightclient)
 
     @check_closed
     def commit(self):
@@ -127,14 +204,14 @@ class Connection(object):
     def cursor(self):
         """Return a new Cursor Object using the connection."""
         cursor = Cursor(self.flightclient, self.options)
-        self.cursors.append(cursor)
+        self.cursors.add(cursor)
 
         return cursor
 
     @check_closed
-    def execute(self, query):
+    def execute(self, query, params=None):
         cursor = self.cursor()
-        return cursor.execute(query)
+        return cursor.execute(query, params)
 
     def __enter__(self):
         return self
@@ -142,6 +219,15 @@ class Connection(object):
     def __exit__(self, *exc):
         self.commit()  # no-op
         self.close()
+
+
+def _close_client(client):
+    close = getattr(client, 'close', None)
+    if close is not None:
+        try:
+            close()
+        except Exception:  # pragma: no cover - best effort on shutdown
+            logger.debug('Error closing Flight client', exc_info=True)
 
 
 class Cursor(object):
@@ -178,8 +264,13 @@ class Cursor(object):
     @check_closed
     def execute(self, query, params=None):
         self.description = None
-        self._results, self.description = execute(
-            query, self.flightclient, self.options)
+        self._results = None
+        query = bind(query, params)
+        try:
+            self._results, self.description = execute(
+                query, self.flightclient, self.options)
+        except Exception as exc:
+            raise translate_error(exc)
         return self
 
     @check_closed

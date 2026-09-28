@@ -1,40 +1,73 @@
-from sqlalchemy import schema, types, pool
+from sqlalchemy import exc, schema, types, pool, util
 from sqlalchemy.engine import default, reflection
-from sqlalchemy.sql import compiler
+from sqlalchemy.sql import compiler, text
+from pyarrow import flight
+
+from sqlalchemy_dremio import db as dbapi_module
 
 _dialect_name = "dremio+flight"
 
+# SQLAlchemy 2.0 has DOUBLE; 1.4 does not.
+_DOUBLE = getattr(types, "DOUBLE", types.FLOAT)
+
+# Keys are the DATA_TYPE values Dremio reports in INFORMATION_SCHEMA."COLUMNS"
+# and DESCRIBE (upper-cased before lookup).
 _type_map = {
-    'boolean': types.BOOLEAN,
     'BOOLEAN': types.BOOLEAN,
-    'varbinary': types.LargeBinary,
-    'VARBINARY': types.LargeBinary,
-    'date': types.DATE,
-    'DATE': types.DATE,
-    'float': types.FLOAT,
-    'FLOAT': types.FLOAT,
-    'decimal': types.DECIMAL,
-    'DECIMAL': types.DECIMAL,
-    'double': types.FLOAT,
-    'DOUBLE': types.FLOAT,
-    'interval': types.Interval,
-    'INTERVAL': types.Interval,
-    'int': types.INTEGER,
+    'TINYINT': types.SMALLINT,
+    'SMALLINT': types.SMALLINT,
     'INT': types.INTEGER,
-    'integer': types.INTEGER,
     'INTEGER': types.INTEGER,
-    'bigint': types.BIGINT,
     'BIGINT': types.BIGINT,
-    'time': types.TIME,
+    'FLOAT': types.FLOAT,
+    'REAL': types.FLOAT,
+    'DOUBLE': _DOUBLE,
+    'DOUBLE PRECISION': _DOUBLE,
+    'DECIMAL': types.DECIMAL,
+    'NUMERIC': types.DECIMAL,
+    'DATE': types.DATE,
     'TIME': types.TIME,
-    'timestamp': types.TIMESTAMP,
     'TIMESTAMP': types.TIMESTAMP,
-    'varchar': types.VARCHAR,
+    'CHAR': types.CHAR,
+    'CHARACTER': types.CHAR,
     'VARCHAR': types.VARCHAR,
-    'smallint': types.SMALLINT,
     'CHARACTER VARYING': types.VARCHAR,
-    'ANY': types.VARCHAR
+    'BINARY': types.VARBINARY,
+    'VARBINARY': types.VARBINARY,
+    'BINARY VARYING': types.VARBINARY,
+    'INTERVAL': types.Interval,
+    'ANY': types.NullType,
+    'NULL': types.NullType,
+    # Complex types have no portable SQLAlchemy equivalent; their values are
+    # returned as Python lists/dicts.
+    'LIST': types.NullType,
+    'ARRAY': types.NullType,
+    'STRUCT': types.NullType,
+    'ROW': types.NullType,
+    'MAP': types.NullType,
 }
+
+
+def _resolve_type(data_type, precision=None, scale=None):
+    name = (data_type or '').strip().upper()
+    if name.startswith('INTERVAL'):
+        return types.Interval()
+    base = name.split('(', 1)[0].strip()
+    type_cls = _type_map.get(base)
+    if type_cls is None:
+        util.warn("Did not recognize Dremio type '%s'" % data_type)
+        return types.NullType()
+    if type_cls is types.DECIMAL:
+        return types.DECIMAL(precision=precision, scale=scale)
+    return type_cls()
+
+
+def _string_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _quote_identifier(value):
+    return '"' + str(value).replace('"', '""') + '"'
 
 
 class DremioExecutionContext(default.DefaultExecutionContext):
@@ -148,111 +181,145 @@ class DremioDialect_flight(default.DefaultDialect):
 
     name = _dialect_name
     driver = _dialect_name
+    supports_statement_cache = True
     supports_sane_rowcount = False
     supports_sane_multi_rowcount = False
+    # The driver returns decimal.Decimal for DECIMAL columns.
+    supports_native_decimal = True
+    supports_native_boolean = True
     poolclass = pool.SingletonThreadPool
     statement_compiler = DremioCompiler
-    paramstyle = 'pyformat'
     ddl_compiler = DremioDDLCompiler
     preparer = DremioIdentifierPreparer
     execution_ctx_cls = DremioExecutionContext
+    # Parameters are rendered client-side by the DB-API module (qmark).
+    default_paramstyle = 'qmark'
 
     def create_connect_args(self, url):
         opts = url.translate_connect_args(username='user')
-        connect_args = {}
-        connectors = ['HOST=%s' % opts['host'],
-                      'PORT=%s' % opts['port']]
+        properties = {'HOST': opts['host'], 'PORT': opts['port']}
 
         if 'user' in opts:
-            connectors.append('{0}={1}'.format('UID', opts['user']))
-            connectors.append('{0}={1}'.format('PWD', opts['password']))
+            properties['UID'] = opts['user']
+            properties['PWD'] = opts.get('password', '')
 
         if 'database' in opts:
-            connectors.append('{0}={1}'.format('Schema', opts['database']))
+            properties['Schema'] = opts['database']
 
         # Clone the query dictionary with lower-case keys.
         lc_query_dict = {k.lower(): v for k, v in url.query.items()}
 
-        def add_property(lc_query_dict, property_name, connectors):
+        for property_name in ('UseEncryption', 'DisableCertificateVerification', 'TrustedCerts',
+                              'routing_queue', 'routing_tag', 'quoting', 'routing_engine',
+                              'Token'):
             if property_name.lower() in lc_query_dict:
-                connectors.append('{0}={1}'.format(property_name, lc_query_dict[property_name.lower()]))
-        
-        add_property(lc_query_dict, 'UseEncryption', connectors)
-        add_property(lc_query_dict, 'DisableCertificateVerification', connectors)
-        add_property(lc_query_dict, 'TrustedCerts', connectors)
-        add_property(lc_query_dict, 'routing_queue', connectors)
-        add_property(lc_query_dict, 'routing_tag', connectors)
-        add_property(lc_query_dict, 'quoting', connectors)
-        add_property(lc_query_dict, 'routing_engine', connectors)
-        add_property(lc_query_dict, 'Token', connectors)
+                properties[property_name] = lc_query_dict[property_name.lower()]
 
-        return [[";".join(connectors)], connect_args]
+        # Keyword properties, not a ";"-joined string, so any value (for
+        # example a password containing ";" or "=") reaches Flight intact.
+        return [[], properties]
 
     @classmethod
-    def dbapi(cls):
+    def import_dbapi(cls):
         import sqlalchemy_dremio.db as module
         return module
 
-    def connect(self, *cargs, **cparams):
-        return self.dbapi.connect(*cargs, **cparams)
+    @classmethod
+    def dbapi(cls):
+        # SQLAlchemy 1.4 entry point; 2.x calls import_dbapi() instead.
+        return cls.import_dbapi()
 
-    def last_inserted_ids(self):
-        return self.context.last_inserted_ids
+    def is_disconnect(self, e, connection, cursor):
+        if isinstance(e, dbapi_module.InterfaceError):
+            return 'closed' in str(e)
+        if isinstance(e, dbapi_module.OperationalError):
+            return isinstance(e.__cause__, flight.FlightUnavailableError)
+        return False
 
-    def get_indexes(self, connection, table_name, schema, **kw):
+    def get_indexes(self, connection, table_name, schema=None, **kw):
         return []
 
     def get_pk_constraint(self, connection, table_name, schema=None, **kw):
-        return []
+        return {"constrained_columns": [], "name": None}
 
     def get_foreign_keys(self, connection, table_name, schema=None, **kw):
         return []
 
-    def get_columns(self, connection, table_name, schema, **kw):
-        sql = "DESCRIBE \"{0}\"".format(table_name)
-        if schema is not None and schema != "":
-            sql = "DESCRIBE \"{0}\".\"{1}\"".format(schema, table_name)
-        cursor = connection.execute(sql)
-        result = []
-        for col in cursor:
-            cname = col[0]
-            ctype = _type_map[col[1]]
-            column = {
-                "name": cname,
-                "type": ctype,
-                "default": None,
-                "comment": None,
-                "nullable": True
-            }
-            result.append(column)
-        return (result)
+    def _columns_from_information_schema(self, connection, table_name, schema):
+        sql = (
+            'SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE '
+            'FROM INFORMATION_SCHEMA."COLUMNS" '
+            'WHERE TABLE_SCHEMA = {0} AND TABLE_NAME = {1} '
+            'ORDER BY ORDINAL_POSITION'
+        ).format(_string_literal(schema), _string_literal(table_name))
+        return [tuple(row) for row in connection.execute(text(sql))]
+
+    def _columns_from_describe(self, connection, table_name):
+        # No schema: let Dremio resolve the name against the session context
+        # (the URL's Schema), as DESCRIBE always has.
+        result = connection.execute(
+            text('DESCRIBE {0}'.format(_quote_identifier(table_name))))
+        keys = [k.upper() for k in result.keys()]
+        out = []
+        for row in result:
+            record = dict(zip(keys, row))
+            out.append((
+                record.get('COLUMN_NAME', row[0]),
+                record.get('DATA_TYPE', row[1]),
+                record.get('NUMERIC_PRECISION'),
+                record.get('NUMERIC_SCALE'),
+                record.get('IS_NULLABLE', 'YES'),
+            ))
+        return out
 
     @reflection.cache
-    def get_table_names(self, connection, schema, **kw):
-        sql = 'SELECT TABLE_NAME FROM INFORMATION_SCHEMA."TABLES"'
+    def get_columns(self, connection, table_name, schema=None, **kw):
+        if schema:
+            described = self._columns_from_information_schema(connection, table_name, schema)
+        else:
+            try:
+                described = self._columns_from_describe(connection, table_name)
+            except exc.DBAPIError:
+                if not self.has_table(connection, table_name, schema):
+                    raise exc.NoSuchTableError(table_name)
+                raise
+        if not described:
+            raise exc.NoSuchTableError(
+                table_name if not schema else '{0}.{1}'.format(schema, table_name))
+        result = []
+        for name, data_type, precision, scale, nullable in described:
+            result.append({
+                "name": name,
+                "type": _resolve_type(data_type, precision, scale),
+                "default": None,
+                "comment": None,
+                "nullable": str(nullable).upper() != 'NO',
+            })
+        return result
+
+    def _table_names(self, connection, schema, views):
+        sql = 'SELECT TABLE_NAME FROM INFORMATION_SCHEMA."TABLES" WHERE TABLE_TYPE {0} \'VIEW\''.format(
+            '=' if views else '<>')
         if schema is not None:
-            sql = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.\"TABLES\" WHERE TABLE_SCHEMA = '" + schema + "'"
+            sql += ' AND TABLE_SCHEMA = ' + _string_literal(schema)
+        return [row[0] for row in connection.execute(text(sql))]
 
-        result = connection.execute(sql)
-        table_names = [r[0] for r in result]
-        return table_names
+    @reflection.cache
+    def get_table_names(self, connection, schema=None, **kw):
+        return self._table_names(connection, schema, views=False)
 
-    def get_schema_names(self, connection, schema=None, **kw):
-        result = connection.execute("SHOW SCHEMAS")
-        schema_names = [r[0] for r in result]
-        return schema_names
+    @reflection.cache
+    def get_view_names(self, connection, schema=None, **kw):
+        return self._table_names(connection, schema, views=True)
 
+    @reflection.cache
+    def get_schema_names(self, connection, **kw):
+        return [row[0] for row in connection.execute(text('SHOW SCHEMAS'))]
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kw):
-        sql = 'SELECT COUNT(*) FROM INFORMATION_SCHEMA."TABLES"'
-        sql += " WHERE TABLE_NAME = '" + str(table_name) + "'"
+        sql = 'SELECT COUNT(*) FROM INFORMATION_SCHEMA."TABLES" WHERE TABLE_NAME = ' + \
+            _string_literal(table_name)
         if schema is not None and schema != "":
-            sql += " AND TABLE_SCHEMA = '" + str(schema) + "'"
-        result = connection.execute(sql)
-        countRows = [r[0] for r in result]
-        return countRows[0] > 0
-
-    def get_view_names(self, connection, schema=None, **kwargs):
-        return []
-        
+            sql += ' AND TABLE_SCHEMA = ' + _string_literal(schema)
+        return connection.execute(text(sql)).scalar() > 0
