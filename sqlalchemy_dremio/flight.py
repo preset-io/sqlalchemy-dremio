@@ -246,10 +246,12 @@ class DremioDialect_flight(default.DefaultDialect):
         return []
 
     def _columns_from_information_schema(self, connection, table_name, schema):
+        # Dremio resolves identifiers case-insensitively, including quoted ones.
+        # Keep catalog lookups consistent with DESCRIBE without losing DECIMAL metadata.
         sql = (
             'SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE '
             'FROM INFORMATION_SCHEMA."COLUMNS" '
-            'WHERE TABLE_SCHEMA = {0} AND TABLE_NAME = {1} '
+            'WHERE UPPER(TABLE_SCHEMA) = UPPER({0}) AND UPPER(TABLE_NAME) = UPPER({1}) '
             'ORDER BY ORDINAL_POSITION'
         ).format(_string_literal(schema), _string_literal(table_name))
         return [tuple(row) for row in connection.execute(text(sql))]
@@ -301,7 +303,7 @@ class DremioDialect_flight(default.DefaultDialect):
         sql = 'SELECT TABLE_NAME FROM INFORMATION_SCHEMA."TABLES" WHERE TABLE_TYPE {0} \'VIEW\''.format(
             '=' if views else '<>')
         if schema is not None:
-            sql += ' AND TABLE_SCHEMA = ' + _string_literal(schema)
+            sql += ' AND UPPER(TABLE_SCHEMA) = UPPER(' + _string_literal(schema) + ')'
         return [row[0] for row in connection.execute(text(sql))]
 
     @reflection.cache
@@ -318,8 +320,8 @@ class DremioDialect_flight(default.DefaultDialect):
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kw):
-        sql = 'SELECT COUNT(*) FROM INFORMATION_SCHEMA."TABLES" WHERE TABLE_NAME = ' + \
-            _string_literal(table_name)
+        sql = 'SELECT COUNT(*) FROM INFORMATION_SCHEMA."TABLES" WHERE UPPER(TABLE_NAME) = UPPER(' + \
+            _string_literal(table_name) + ')'
         if schema is not None and schema != "":
-            sql += ' AND TABLE_SCHEMA = ' + _string_literal(schema)
+            sql += ' AND UPPER(TABLE_SCHEMA) = UPPER(' + _string_literal(schema) + ')'
         return connection.execute(text(sql)).scalar() > 0

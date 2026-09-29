@@ -38,7 +38,8 @@ def render_literal(value):
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, int):
-        return str(value)
+        # Keep subtraction adjacent to a bind from becoming a SQL comment.
+        return "(%s)" % value if value < 0 else str(value)
     if isinstance(value, float):
         if math.isnan(value):
             return "CAST('NaN' AS DOUBLE)"
@@ -49,7 +50,18 @@ def render_literal(value):
     if isinstance(value, decimal.Decimal):
         if not value.is_finite():
             raise ProgrammingError("Dremio DECIMAL cannot represent %r" % value)
-        return format(value, "f")
+        # Calcite rejects large bare numeric literals even when they fit
+        # Dremio's DECIMAL(38, s). Cast a string, preserving scale and avoiding
+        # a leading minus (including signed zero) next to SQL subtraction.
+        _, digits, exponent = value.as_tuple()
+        scale = max(-exponent, 0)
+        precision = max(len(digits) + max(exponent, 0), scale, 1)
+        if precision > 38:
+            raise ProgrammingError(
+                "Dremio DECIMAL supports precision and scale up to 38; "
+                "parameter requires DECIMAL(%d,%d)" % (precision, scale)
+            )
+        return "CAST('%s' AS DECIMAL(%d,%d))" % (format(value, "f"), precision, scale)
     # datetime before date: datetime is a date subclass.
     if isinstance(value, datetime.datetime):
         if value.tzinfo is not None and value.utcoffset() is not None:

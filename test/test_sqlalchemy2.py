@@ -186,7 +186,7 @@ def test_reflection_executes_textual_sql_under_sqlalchemy_2(make_engine):
     assert inspector.has_table("t", schema="$scratch") is True
     assert (
         'SELECT TABLE_NAME FROM INFORMATION_SCHEMA."TABLES" WHERE TABLE_TYPE <> \'VIEW\''
-        " AND TABLE_SCHEMA = '$scratch'"
+        " AND UPPER(TABLE_SCHEMA) = UPPER('$scratch')"
     ) in client.sent
 
 
@@ -209,7 +209,7 @@ def test_get_columns_types_decimal_scale_and_nullability(make_engine):
     assert client.sent[-1] == (
         "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE "
         'FROM INFORMATION_SCHEMA."COLUMNS" '
-        "WHERE TABLE_SCHEMA = '$scratch' AND TABLE_NAME = 't' ORDER BY ORDINAL_POSITION"
+        "WHERE UPPER(TABLE_SCHEMA) = UPPER('$scratch') AND UPPER(TABLE_NAME) = UPPER('t') ORDER BY ORDINAL_POSITION"
     )
 
 
@@ -218,7 +218,7 @@ def test_reflection_escapes_quotes_in_names(make_engine):
     answers['SELECT COUNT(*) FROM INFORMATION_SCHEMA."TABLES"'] = one_column("EXPR$0", [0], pa.int64())
     client = FakeFlightClient(answers)
     assert sa.inspect(make_engine(client)).has_table("x' OR '1'='1", schema="s'") is False
-    assert client.sent[-1].endswith("WHERE TABLE_NAME = 'x'' OR ''1''=''1' AND TABLE_SCHEMA = 's'''")
+    assert client.sent[-1].endswith("WHERE UPPER(TABLE_NAME) = UPPER('x'' OR ''1''=''1') AND UPPER(TABLE_SCHEMA) = UPPER('s''')")
 
 
 def test_autoload_of_absent_table_raises_no_such_table(make_engine):
@@ -315,7 +315,7 @@ def test_bound_parameters_are_rendered_as_typed_literals(make_engine):
             },
         ).all()
     assert client.sent[-1] == (
-        "SELECT 'it''s ? :x', 42, CAST(0.1 AS DOUBLE), 12345.67, "
+        "SELECT 'it''s ? :x', 42, CAST(0.1 AS DOUBLE), CAST('12345.67' AS DECIMAL(7,2)), "
         "TIMESTAMP '2024-02-29 13:14:15.123000', DATE '2024-02-29', NULL, TRUE, "
         "'?' AS q, \"a?\" FROM t -- ?\nWHERE x = 'it''s ? :x'"
     )
@@ -334,10 +334,10 @@ def test_core_limit_is_rendered(make_engine):
     [
         (None, "NULL"),
         (False, "FALSE"),
-        (-7, "-7"),
+        (-7, "(-7)"),
         (float("nan"), "CAST('NaN' AS DOUBLE)"),
         (float("-inf"), "CAST('-Infinity' AS DOUBLE)"),
-        (decimal.Decimal("1E-10"), "0.0000000001"),
+        (decimal.Decimal("1E-10"), "CAST('0.0000000001' AS DECIMAL(10,10))"),
         (b"\x00\xff", "FROM_HEX('00ff')"),
         (datetime.time(1, 2, 3, 4), "TIME '01:02:03.000004'"),
         (
@@ -402,3 +402,90 @@ def test_distribution_does_not_cap_sqlalchemy_or_pyarrow():
 
     requires = {r.split(";")[0].replace(" ", "") for r in im.requires("sqlalchemy_dremio")}
     assert requires == {"SQLAlchemy<3,>=1.4", "pyarrow>=10.0.0"}
+
+
+@pytest.mark.parametrize('value', [-1, decimal.Decimal('-1'), decimal.Decimal('-0'), decimal.Decimal('-0.00')])
+def test_review_negative_binding_cannot_start_comment(value, make_engine):
+    from sqlalchemy_dremio.params import bind
+
+    assert '--' not in bind('SELECT 1-?', [value])
+    client = FakeFlightClient({'SELECT': one_column('a', [1], pa.int32())})
+    with make_engine(client).connect() as conn:
+        conn.execute(sa.text("SELECT * FROM t WHERE a < 100-:n AND tenant = :tenant"),
+                     {'n': value, 'tenant': 'x'}).all()
+    assert '--' not in client.sent[-1]
+    assert client.sent[-1].endswith(" AND tenant = 'x'")
+
+
+@pytest.mark.parametrize('value, precision, scale', [
+    ('12345678901234567890.123456789', 29, 9),
+    ('-12345678901234567890.123456789', 29, 9),
+    ('99999999999999999999999999999999999999', 38, 0),
+    ('1E-38', 38, 38), ('1E+20', 21, 0), ('0.00100', 5, 5),
+    ('-0.00', 2, 2), ('0', 1, 0),
+])
+def test_review_decimal_exact_cast(value, precision, scale):
+    from sqlalchemy_dremio.params import render_literal
+
+    value = decimal.Decimal(value)
+    assert render_literal(value) == "CAST('%s' AS DECIMAL(%d,%d))" % (
+        format(value, 'f'), precision, scale)
+
+
+@pytest.mark.parametrize('value', ['1E-40', '1E+38', '1E+1000000', 'NaN', '-Infinity'])
+def test_review_decimal_out_of_range_fails_before_transport(value, make_engine):
+    client = FakeFlightClient()
+    with make_engine(client).connect() as conn:
+        with pytest.raises(sa.exc.ProgrammingError, match='Dremio DECIMAL'):
+            conn.execute(sa.text('SELECT :value'), {'value': decimal.Decimal(value)})
+    assert client.sent == []
+
+
+@pytest.mark.parametrize('table_name, schema', [('mixed', 'nas.sub'), ('typed', 'NAS'), ("x'", "s'")])
+def test_review_case_insensitive_reflection(table_name, schema, make_engine):
+    # Require the actual SQL predicate, not a fake that accepts either spelling.
+    quote = lambda value: "'" + value.replace("'", "''") + "'"
+    columns_sql = (
+        'SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE '
+        'FROM INFORMATION_SCHEMA."COLUMNS" '
+        'WHERE UPPER(TABLE_SCHEMA) = UPPER(%s) AND UPPER(TABLE_NAME) = UPPER(%s) '
+        'ORDER BY ORDINAL_POSITION' % (quote(schema), quote(table_name)))
+    has_sql = ('SELECT COUNT(*) FROM INFORMATION_SCHEMA."TABLES" '
+               'WHERE UPPER(TABLE_NAME) = UPPER(%s) AND UPPER(TABLE_SCHEMA) = UPPER(%s)'
+               % (quote(table_name), quote(schema)))
+    client = FakeFlightClient({
+        columns_sql: pa.table({'COLUMN_NAME': ['amount'], 'DATA_TYPE': ['DECIMAL'],
+                              'NUMERIC_PRECISION': [29], 'NUMERIC_SCALE': [9],
+                              'IS_NULLABLE': ['YES']}),
+        has_sql: one_column('n', [1], pa.int64()),
+    })
+    engine = make_engine(client)
+    assert sa.inspect(engine).has_table(table_name, schema=schema)
+    table = sa.Table(table_name, sa.MetaData(), schema=schema, autoload_with=engine)
+    assert (table.c.amount.type.precision, table.c.amount.type.scale) == (29, 9)
+
+
+def test_review_python_classifiers_match_requires(monkeypatch):
+    import runpy
+    import setuptools
+    from pathlib import Path
+    from packaging.specifiers import SpecifierSet
+
+    metadata = {}
+    monkeypatch.setattr(setuptools, 'setup', lambda **kwargs: metadata.update(kwargs))
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / 'setup.py'))
+    requires = SpecifierSet(metadata['python_requires'])
+    versions = [c.rsplit(' :: ', 1)[-1] for c in metadata['classifiers']
+                if c.startswith('Programming Language :: Python :: ') and '.' in c]
+    assert versions
+    assert all(version in requires for version in versions)
+
+
+@pytest.mark.parametrize('views', [False, True])
+def test_review_table_listing_schema_is_case_insensitive(views, make_engine):
+    sql = ('SELECT TABLE_NAME FROM INFORMATION_SCHEMA."TABLES" WHERE TABLE_TYPE %s '
+           "'VIEW' AND UPPER(TABLE_SCHEMA) = UPPER('NAS.Sub')" % ('=' if views else '<>'))
+    client = FakeFlightClient({sql: one_column('TABLE_NAME', ['Mixed'], pa.string())})
+    inspector = sa.inspect(make_engine(client))
+    method = inspector.get_view_names if views else inspector.get_table_names
+    assert method(schema='NAS.Sub') == ['Mixed']
