@@ -518,7 +518,6 @@ def test_review_comment_bind_injection_fails_before_transport(comment, ending, m
 
 def test_review_numeric_subclasses_use_builtin_rendering():
     from enum import IntEnum
-    import numpy as np
     from sqlalchemy_dremio.params import render_literal
 
     class Status(IntEnum):
@@ -538,6 +537,12 @@ def test_review_numeric_subclasses_use_builtin_rendering():
     assert render_literal(Status.ACTIVE) == '1'
     assert render_literal(NegativeInt(-2)) == '(-2)'
     assert render_literal(Float(1.5)) == 'CAST(1.5 AS DOUBLE)'
+
+
+def test_review_numpy_float_subclass_uses_builtin_rendering():
+    np = pytest.importorskip('numpy')
+    from sqlalchemy_dremio.params import render_literal
+
     assert render_literal(np.float64(1.5)) == 'CAST(1.5 AS DOUBLE)'
 
 

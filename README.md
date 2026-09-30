@@ -84,7 +84,7 @@ Release Notes
 3.0.5.1
 -------
 - SQLAlchemy 2: reflection (`get_schema_names`, `get_table_names`, `get_view_names`,
-  `has_table`, `get_columns`) executes `text()` statements, the dialect implements
+  `has_table`, `get_columns`) uses `exec_driver_sql()` for raw SQL, the dialect implements
   `import_dbapi` and enables the statement cache. Still works with SQLAlchemy 1.4.
 - Results are converted directly from Arrow, not through pandas: TIMESTAMP columns of any
   unit are `datetime` (previously a `KeyError` for `datetime64[ms]`), integers stay
