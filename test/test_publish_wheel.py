@@ -141,3 +141,18 @@ def test_failed_retry_removes_stale_receipt(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         publisher['main']()
     assert not Path('published.sha256').exists()
+
+
+def test_jenkins_separates_pr_artifacts_from_stable_prefix():
+    jenkins = (Path(__file__).resolve().parents[1] / 'Jenkinsfile').read_text()
+    assert 'key = isPR ? "pr/sqlalchemy-dremio/${env.CHANGE_ID}/${wheel}"' in jenkins
+    assert ': "sqlalchemy-dremio/${wheel}"' in jenkins
+
+
+def test_jenkins_tests_both_supported_sqlalchemy_lines():
+    jenkins = (Path(__file__).resolve().parents[1] / 'Jenkinsfile').read_text()
+    loop = jenkins.split('for sa_version in 1.4.54 2.0.52; do', 1)[1].split('done', 1)[0]
+    assert 'pip install "sqlalchemy==$sa_version"' in loop
+    assert '-W error::DeprecationWarning' in loop
+    for module in ('sqlalchemy2', 'additional', 'flight_dialect', 'publish_wheel'):
+        assert 'test/test_' + module + '.py' in loop

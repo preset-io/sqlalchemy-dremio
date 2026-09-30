@@ -38,6 +38,7 @@ def render_literal(value):
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, int):
+        value = int(value)
         # Keep subtraction adjacent to a bind from becoming a SQL comment.
         return "(%s)" % value if value < 0 else str(value)
     if isinstance(value, float):
@@ -46,7 +47,7 @@ def render_literal(value):
         if math.isinf(value):
             return "CAST('%sInfinity' AS DOUBLE)" % ("-" if value < 0 else "")
         # A bare 0.1 is an exact DECIMAL literal; keep the float a DOUBLE.
-        return "CAST(%s AS DOUBLE)" % repr(value)
+        return "CAST(%s AS DOUBLE)" % repr(float(value))
     if isinstance(value, decimal.Decimal):
         if not value.is_finite():
             raise ProgrammingError("Dremio DECIMAL cannot represent %r" % value)
@@ -102,9 +103,11 @@ def _placeholders(statement):
                     break
                 i += 1
             i += 1
-        elif char == "-" and statement.startswith("--", i):
-            end = statement.find("\n", i)
-            i = length if end < 0 else end + 1
+        elif statement.startswith(("--", "//"), i):
+            # Calcite ends either single-line comment at CR or LF.
+            i += 2
+            while i < length and statement[i] not in "\r\n":
+                i += 1
         elif char == "/" and statement.startswith("/*", i):
             end = statement.find("*/", i + 2)
             i = length if end < 0 else end + 2

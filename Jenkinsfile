@@ -45,7 +45,9 @@ podTemplate(
                     error("Non-master build produced a non-local version ${version}; refusing.")
                 }
                 wheel = "sqlalchemy_dremio-${version}-py3-none-any.whl"
-                key = "sqlalchemy-dremio/${wheel}"
+                // Keep local-version PR wheels out of the stable package prefix.
+                key = isPR ? "pr/sqlalchemy-dremio/${env.CHANGE_ID}/${wheel}"
+                    : "sqlalchemy-dremio/${wheel}"
             }
             stage('Test and build') {
                 withEnv(["PUBLISH_VERSION=${version}", "WHEEL=${wheel}"]) {
@@ -56,8 +58,11 @@ podTemplate(
                             'boto3>=1.36,<2' 'build==1.4.4' 'setuptools==80.9.0' 'wheel==0.45.1'
                         .venv/bin/pip install --no-deps .
                         # Server-free regressions; test/test_dremio.py needs a live Dremio.
-                        .venv/bin/python -m pytest -q -p no:cacheprovider test/test_sqlalchemy2.py \
-                            test/test_additional.py test/test_flight_dialect.py test/test_publish_wheel.py
+                        for sa_version in 1.4.54 2.0.52; do
+                            .venv/bin/pip install "sqlalchemy==$sa_version"
+                            .venv/bin/python -m pytest -q -W error::DeprecationWarning -p no:cacheprovider test/test_sqlalchemy2.py \
+                                test/test_additional.py test/test_flight_dialect.py test/test_publish_wheel.py
+                        done
                         .venv/bin/python - <<'PY'
 import os
 from pathlib import Path

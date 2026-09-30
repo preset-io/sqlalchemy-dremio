@@ -1,6 +1,6 @@
 from sqlalchemy import exc, schema, types, pool, util
 from sqlalchemy.engine import default, reflection
-from sqlalchemy.sql import compiler, text
+from sqlalchemy.sql import compiler
 from pyarrow import flight
 
 from sqlalchemy_dremio import db as dbapi_module
@@ -233,7 +233,8 @@ class DremioDialect_flight(default.DefaultDialect):
         if isinstance(e, dbapi_module.InterfaceError):
             return 'closed' in str(e)
         if isinstance(e, dbapi_module.OperationalError):
-            return isinstance(e.__cause__, flight.FlightUnavailableError)
+            return isinstance(e.__cause__, (
+                flight.FlightUnavailableError, flight.FlightUnauthenticatedError))
         return False
 
     def get_indexes(self, connection, table_name, schema=None, **kw):
@@ -254,13 +255,13 @@ class DremioDialect_flight(default.DefaultDialect):
             'WHERE UPPER(TABLE_SCHEMA) = UPPER({0}) AND UPPER(TABLE_NAME) = UPPER({1}) '
             'ORDER BY ORDINAL_POSITION'
         ).format(_string_literal(schema), _string_literal(table_name))
-        return [tuple(row) for row in connection.execute(text(sql))]
+        return [tuple(row) for row in connection.exec_driver_sql(sql)]
 
     def _columns_from_describe(self, connection, table_name):
         # No schema: let Dremio resolve the name against the session context
         # (the URL's Schema), as DESCRIBE always has.
-        result = connection.execute(
-            text('DESCRIBE {0}'.format(_quote_identifier(table_name))))
+        result = connection.exec_driver_sql(
+            'DESCRIBE {0}'.format(_quote_identifier(table_name)))
         keys = [k.upper() for k in result.keys()]
         out = []
         for row in result:
@@ -304,7 +305,7 @@ class DremioDialect_flight(default.DefaultDialect):
             '=' if views else '<>')
         if schema is not None:
             sql += ' AND UPPER(TABLE_SCHEMA) = UPPER(' + _string_literal(schema) + ')'
-        return [row[0] for row in connection.execute(text(sql))]
+        return [row[0] for row in connection.exec_driver_sql(sql)]
 
     @reflection.cache
     def get_table_names(self, connection, schema=None, **kw):
@@ -316,7 +317,7 @@ class DremioDialect_flight(default.DefaultDialect):
 
     @reflection.cache
     def get_schema_names(self, connection, **kw):
-        return [row[0] for row in connection.execute(text('SHOW SCHEMAS'))]
+        return [row[0] for row in connection.exec_driver_sql('SHOW SCHEMAS')]
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kw):
@@ -324,4 +325,4 @@ class DremioDialect_flight(default.DefaultDialect):
             _string_literal(table_name) + ')'
         if schema is not None and schema != "":
             sql += ' AND UPPER(TABLE_SCHEMA) = UPPER(' + _string_literal(schema) + ')'
-        return connection.execute(text(sql)).scalar() > 0
+        return connection.exec_driver_sql(sql).scalar() > 0

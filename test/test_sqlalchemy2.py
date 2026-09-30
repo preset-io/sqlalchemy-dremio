@@ -489,3 +489,89 @@ def test_review_table_listing_schema_is_case_insensitive(views, make_engine):
     inspector = sa.inspect(make_engine(client))
     method = inspector.get_view_names if views else inspector.get_table_names
     assert method(schema='NAS.Sub') == ['Mixed']
+
+
+@pytest.mark.parametrize('comment', ['--', '//'])
+@pytest.mark.parametrize('ending', ['\n', '\r', '\r\n'])
+def test_review_single_line_comment_boundaries(comment, ending):
+    from sqlalchemy_dremio.params import bind
+
+    sql = 'SELECT 1 ' + comment + ' ?' + ending + ', ?'
+    assert bind(sql, ['x']) == sql[:-1] + "'x'"
+    assert bind('-- c\r?', [7]) == '-- c\r7'
+    with pytest.raises(ProgrammingError, match='0 placeholder'):
+        bind('SELECT 1 ' + comment + ' ?', [7])
+
+
+@pytest.mark.parametrize('comment', ['--', '//'])
+@pytest.mark.parametrize('ending', ['\n', '\r'])
+def test_review_comment_bind_injection_fails_before_transport(comment, ending, make_engine):
+    client = FakeFlightClient()
+    with make_engine(client).connect() as conn:
+        with pytest.raises(sa.exc.ProgrammingError, match='1 placeholder.*2 parameter'):
+            conn.execute(sa.text(
+                "SELECT * FROM (VALUES (1,'x'),(20,'y')) t(a,tenant) "
+                "WHERE a > 0 " + comment + " scoped to :tenant" + ending +
+                " AND tenant = :tenant"), {'tenant': '\nOR TRUE --'})
+    assert client.sent == []
+
+
+def test_review_numeric_subclasses_use_builtin_rendering():
+    from enum import IntEnum
+    import numpy as np
+    from sqlalchemy_dremio.params import render_literal
+
+    class Status(IntEnum):
+        ACTIVE = 1
+
+        def __str__(self):
+            return 'Status.ACTIVE'
+
+    class NegativeInt(int):
+        def __str__(self):
+            return 'not_a_number'
+
+    class Float(float):
+        def __repr__(self):
+            return 'not_a_number'
+
+    assert render_literal(Status.ACTIVE) == '1'
+    assert render_literal(NegativeInt(-2)) == '(-2)'
+    assert render_literal(Float(1.5)) == 'CAST(1.5 AS DOUBLE)'
+    assert render_literal(np.float64(1.5)) == 'CAST(1.5 AS DOUBLE)'
+
+
+def test_review_reflection_colons_are_not_bind_parameters(make_engine):
+    answers = _information_schema_answers()
+    answers['DESCRIBE "tag (:v1)"'] = pa.table({
+        'COLUMN_NAME': ['id'], 'DATA_TYPE': ['INTEGER']})
+    client = FakeFlightClient(answers)
+    engine = make_engine(client)
+    inspector = sa.inspect(engine)
+    name = 'tag (:v1)'
+    assert inspector.has_table(name, schema=name)
+    assert inspector.get_columns(name, schema=name)
+    assert inspector.get_columns(name)[0]['name'] == 'id'
+    assert inspector.get_table_names(schema=name) == ['t']
+    assert inspector.get_view_names(schema=name) == ['v']
+    assert all('?' not in sql for sql in client.sent)
+    assert sum(name in sql for sql in client.sent) == 5
+    engine.dispose()
+
+
+def test_review_expired_token_pre_ping_reconnects(monkeypatch):
+    stale = FakeFlightClient({'SELECT 1': flight.FlightUnauthenticatedError('expired token')})
+    fresh = FakeFlightClient({'SELECT 1': one_column('n', [1], pa.int32())})
+    clients = iter([stale, fresh])
+    monkeypatch.setattr(flight, 'FlightClient', lambda *args, **kwargs: next(clients))
+    engine = sa.create_engine(
+        'dremio+flight://user:pass@localhost:32010/?UseEncryption=false', pool_pre_ping=True)
+    with engine.connect():
+        pass
+    with engine.connect() as conn:
+        assert conn.exec_driver_sql('SELECT 1').scalar() == 1
+    assert stale.closed
+    assert stale.sent == ['SELECT 1']
+    assert fresh.credentials == ('user', 'pass')
+    engine.dispose()
+    assert fresh.closed
