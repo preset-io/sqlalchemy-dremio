@@ -48,6 +48,7 @@ TLS:
 
 UseEncryption=true|false - (Optional) Enables TLS connection. Must be enabled on Dremio to use it.
 DisableCertificateVerification=true|false - (Optional) Disables certificate verification.
+TrustedCerts=<path to PEM> - (Optional) Trust these CA certificates instead of the system store.
 
 WLM:
 
@@ -79,6 +80,29 @@ The ODBC connection to superset is now deprecated. Please update sqlalchemy_drem
 
 Release Notes
 -------------
+
+3.0.5.1
+-------
+- SQLAlchemy 2: reflection (`get_schema_names`, `get_table_names`, `get_view_names`,
+  `has_table`, `get_columns`) uses `exec_driver_sql()` for raw SQL, the dialect implements
+  `import_dbapi` and enables the statement cache. Still works with SQLAlchemy 1.4.
+- Results are converted directly from Arrow, not through pandas: TIMESTAMP columns of any
+  unit are `datetime` (previously a `KeyError` for `datetime64[ms]`), integers stay
+  `int` next to NULLs, DATE is `date`, DECIMAL is `Decimal`, NULL is `None`.
+  `cursor.description` has seven items with the Dremio type name as `type_code`.
+- `get_columns` reads `INFORMATION_SCHEMA."COLUMNS"`: DECIMAL keeps precision and scale,
+  nullability is reported, and unknown types become `NullType` instead of a `KeyError`.
+  Views are listed by `get_view_names` and no longer by `get_table_names`. Names are
+  escaped in catalog queries. Autoloading an absent table raises `NoSuchTableError`.
+- Bound parameters (qmark) are rendered client-side as typed SQL literals; previously they
+  were silently dropped. `?` inside string literals, quoted identifiers and comments is
+  left alone, and values are rendered exactly once.
+- Arrow Flight errors are raised as DB-API exceptions (`ProgrammingError`,
+  `OperationalError`, ...), so SQLAlchemy wraps them and invalidates dead connections.
+- Connection properties are passed as keyword arguments, so passwords may contain `;`
+  and `=`. Closing a connection closes its Flight client.
+- Packaging: requires `SQLAlchemy>=1.4,<3` and `pyarrow>=10.0.0` (3.0.5 pinned
+  `SQLAlchemy~=2.0.41` and `pyarrow~=20.0.0`); pandas is no longer used.
 
 3.0.4
 -----

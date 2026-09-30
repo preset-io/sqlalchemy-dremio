@@ -14,27 +14,28 @@ def test_create_connect_args_all_options():
         "&quoting=double&routing_engine=engine1&Token=mytoken"
     )
     dialect = DremioDialect_flight()
-    args, kwargs = dialect.create_connect_args(sa_url.make_url(conn_url))
-    connectors = args[0].split(";")
-    assert "HOST=localhost" in connectors
-    assert "PORT=32010" in connectors
-    assert "Schema=db" in connectors
-    assert "UseEncryption=false" in connectors
-    assert "DisableCertificateVerification=true" in connectors
-    assert "TrustedCerts=/tmp/ca.pem" in connectors
-    assert "routing_queue=prod" in connectors
-    assert "routing_tag=tag1" in connectors
-    assert "quoting=double" in connectors
-    assert "routing_engine=engine1" in connectors
-    assert "Token=mytoken" in connectors
-    assert kwargs == {}
+    args, properties = dialect.create_connect_args(sa_url.make_url(conn_url))
+    assert args == []
+    assert properties == {
+        "HOST": "localhost",
+        "PORT": 32010,
+        "Schema": "db",
+        "UseEncryption": "false",
+        "DisableCertificateVerification": "true",
+        "TrustedCerts": "/tmp/ca.pem",
+        "routing_queue": "prod",
+        "routing_tag": "tag1",
+        "quoting": "double",
+        "routing_engine": "engine1",
+        "Token": "mytoken",
+    }
 
 
 def test_cursor_fetch_methods(monkeypatch):
     cursor = db.Cursor(flightclient=None, options=None)
 
     def fake_execute(sql, flightclient=None, options=None):
-        return [[[1]], [("a", None, None, None, True)]]
+        return [[[1]], [("a", "INTEGER", None, None, None, None, True)]]
 
     monkeypatch.setattr(db, "execute", fake_execute)
 
